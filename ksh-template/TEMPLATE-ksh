@@ -1,0 +1,187 @@
+#!/bin/ksh
+
+##
+# TEMPLATE-ksh:  a template for system scripts
+# 
+# This is a template shell script that can serve as a great starting
+# point for a shell script. Look for "FIX" throughout the code below
+# and change it as you see fit, and please replace this paragraph with
+# a brief comment describing your script. When you're finished, place
+# this program in your shared script directory.
+# 
+# Note that the script requires the included library, libadm.sh.
+# 
+# $Id: TEMPLATE-ksh,v 1.9 2002/04/12 17:04:56 shaug Exp $
+##
+
+trap sigdie INT QUIT 
+umask 022
+
+# safety checks:  exit on unset variables and errors, don't expand *
+set -o nounset
+set -o errexit
+set -o noglob
+
+# set up the environment
+ME=${0##*/}
+VERSION=$(set $Revision$; print $2)
+FIX="add more customizable variables here"
+USAGE="usage: $ME FIX - put usage info here"
+HELP=$(cat <<EOhelp
+$ME: FIX one-line description goes here
+
+Usage: $ME FIX usage info goes here
+       $ME -v
+       $ME -h
+       $ME --help
+
+Options:
+       -v             Show the script version ($VERSION)
+       -h             Show this "help" message
+       --help         Show more comprehensive usage information
+       FIX            describe other options here
+EOhelp)
+. $HOME/lib/libadm.sh
+
+# process the command line
+[[ "$1" = "--help" ]] && { perldoc -U -t -F $0; exit $EX_OK; }
+while getopts :FIX:vh opt; do
+    case $opt in
+    F)      : Change FIX:vh in the getopts call above and then act on ;;
+    I)      : those switches here in the case statement.  See getopts(1). ;;
+    X)      : Leave h, v, and ? in the getopts call and case statement.
+            : They're good to keep for standard usage conventions.
+            : Note that the current option's value can be found in $OPTARG. ;;
+    h)      print "$HELP"; die $EX_OK;;
+    v)      die $EX_OK "version $VERSION";;
+    ?)      die $EX_USAGE "$OPTARG is an invalid option" "$USAGE" \
+                          "See '$ME -h' for more info.";;
+    esac
+done
+shift $(expr $OPTIND - 1)
+
+# eat up the rest of the cmd-line args if they weren't all gobbled up
+# in the getopts loop
+FIX1=$1
+FIX2=$2
+FIX3="$@"
+
+# FIX: this would be a good place to 
+# make sure required options are set.
+# e.g....
+#[[ -n "$option" ]] || die $EX_USAGE "failure: option is required" "$USAGE"
+
+# record that someone has been here
+find_caller
+logger -p local7.info -t $ME \
+ "[$$] $remote_user@$remote_host: FIX=\`$enter processed cmd-line args here'"
+
+
+##
+## Main
+##
+
+# FIX: do whatcha gotta do right here, then exit with $EX_OK on success
+# or some other value from libadm.sh on failure.
+# Make sure to print out "success:" or "failure:" as the first part of
+# your die() message to provide a searchable exit status.
+
+
+die $EX_OK "success: FIX: some useful info could go here."
+
+
+# Perl-style Plain Old Documentation (POD) lives below here.
+#
+# FIX:  Fill out the POD info below
+
+<<PODblock
+
+=head1 FIX(command name)
+
+FIX - command name and one-line description goes here
+
+
+=head1 SYNOPSIS
+
+B<FIX(command name)> I<arg1> I<arg2> [I<opt1> I<opt2> ...]
+
+B<FIX(command name)> -v
+
+B<FIX(command name)> -h
+
+B<FIX(command name)> --help
+
+
+=head1 DESCRIPTION
+
+FIX:  put a paraphraph or two describing how the command works, what it
+does, what it expects, what it won't do, etc.
+
+
+=head1 OPTIONS
+
+=over 4
+
+=item FIX: list options here
+
+FIX: description for an option
+
+=item FIX: another option
+
+FIX: another option's description
+
+=item -v
+
+Show the version of the script
+
+=item -h
+
+Show a brief summary of usage
+
+=item --help
+
+Show a comprehensive manual for the script
+
+=back
+
+
+=head1 FILES
+
+=over 4
+
+=item F<FIX(list files here)>
+
+FIX: description of file
+
+=back
+
+
+=head1 DIAGNOSTICS
+
+Any output that doesn't start with "FIX(name of command): success" indicates
+a problem of some kind.  If it is a fatal error, it will begin with
+"FIX(name of command): failure".
+
+
+=head1 REQUIRES
+
+FIX: list required programs here
+
+
+=head1 BUGS
+
+Please contact the author if you encounter errors or have feature
+suggestions.
+
+
+=head1 SEE ALSO
+
+FIX: list related commands here
+
+
+=head1 AUTHOR
+
+Copyright © 2002-2012 O'Shaughnessy Evans
+
+=cut
+PODblock

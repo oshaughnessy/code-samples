@@ -17,6 +17,12 @@ Samples include:
                           in a database with ENUM DNS records and reports
                           discrepancies.
 
+  ksh-template            A template useful for writing new shell scripts.
+                          Includes help and usage messages and argument
+                          processing. Intended to help standardize the
+                          way a shop's shell scripts are written.
+                          Easily adapted for sh/bash.
+
   magilla                 A brief Python script, written on top of scapy
                           (see http://www.secdev.org/projects/scapy/), to
                           communicate with a VoIP phone switch over MGCP.
