@@ -1,5 +1,4 @@
-This directory includes samples of software written by O'Shaughnessy Evans,
-shaug@wumpus.org.
+This directory includes samples of software written by O'Shaughnessy Evans.
 
 Samples include:
 
