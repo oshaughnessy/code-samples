@@ -1,0 +1,224 @@
+#!/usr/bin/perl
+
+##
+# enum-audit:  pull the list of active phone numbers from the voip
+#              provisioning database, look for enum info that points to
+#              the given domain (NAPTR DNS records), and report any
+#              numbers that don't jive.
+# 
+# This script runs out of cron on (servername redacted).
+# 
+# Sample from the voip db:
+# 
+#   mysql> select * from PhoneNumber;
+#   +----------+-----+-----+------+-------------+--------+-----------+
+#   | IslandID | NPA | NXX | Line | PhoneNumber | Status | BlockType |
+#   +----------+-----+-----+------+-------------+--------+-----------+
+#   |        1 |   0 |   0 |    0 |           0 | R      | NULL      |
+#   |        2 | 808 | 555 | 1000 |  8085551000 | I      | CORP      |
+#   |        2 | 808 | 555 | 1001 |  8085551001 | A      | CORP      |
+#   |        2 | 808 | 555 | 1002 |  8085551002 | I      | CORP      |
+# 
+# Status is:  A (active in the VoIP system),
+#             I (inactive but available for use),
+#             P (ported out of the VoIP system), or
+#             R (reserved temporarily during provisioning)
+# 
+# To pull the active voip numbers, we use this query:
+# 
+#   mysql> select * from PhoneNumber where BlockType = "VOIP" and
+#          ( Status = "A" or Status = "I" );
+# 
+# $Id: enum-audit,v 1.4 2008/02/12 20:36:27 shaug Exp $
+# $Source: /export/home/shaug/projects/voip/RCS/enum-audit,v $
+# 
+# Copyright (C) 2007-2008 O'Shaughnessy Evans
+##
+
+use DBI;
+use Net::DNS;
+
+# what area code should we prefix is a 7-digit number is given?
+use constant DEF_AREACODE => '808';
+
+# name of the Ser database and subscriber information table
+use constant SER_DB    => 'voip';
+use constant SER_TABLE => 'subscriber';
+
+# name of the Asterisk database and voicemail information table
+use constant VOIP_DB    => 'voip';
+use constant VOIP_TABLE => 'PhoneNumber';
+
+# read connection info for the Ser and Asterisk databases from these files
+use constant MYSQL_CNF => '/usr/local/etc/my.cnf-voip';
+
+# enum records must rewrite phone numbers according to this pattern in order
+# to be considered local
+use constant ENUM_LOCAL_PAT => qr/redacted-voip-domain\.com$/;
+
+# sample DNS zone file entry for a phone number's NAPTR record
+# 1st %s will be replaced with the number's enum-format hostname
+# 2nd %s will be replaced with the phone number
+use constant NAPTR_FMT => '%s IN NAPTR 10 10 "u" "e2u+sip" "!^.*$!sip:%s@redacted-voip-domain.com!" .';
+
+# first make sure we can connect to the databases.  if we can't, exit.
+my $voipdsn = 'DBI:mysql:'. VOIP_DB. ';mysql_read_default_file='. MYSQL_CNF.
+                                     ';mysql_read_default_group=voip';
+my $voipdb = DBI->connect($voipdsn, '', '', { RaiseError => 1,
+                                              AutoCommit => 0 });
+
+# select all the active phone numbers from the database
+my $voip_sql = 'SELECT PhoneNumber FROM '. VOIP_TABLE. ' where BlockType = '.
+               '"VOIP" and ( Status = "A" or Status = "I" )';
+my $voip_sel = $voipdb->selectall_arrayref($voip_sql);
+if (scalar @$voip_sel == 0) {
+    print "no phone numbers available.\n";
+    exit;
+}
+else {
+    print scalar @$voip_sel. " VoIP service numbers found that are listed as ".
+          "active or available for use.\n".
+          "Auditing associated ENUM records.\n";
+}
+
+# process the list of numbers:
+# look for an naptr dns record for each
+# take note of those that don't have a record and those that aren't pointing
+# to redacted-voip-domain.com
+my $res = Net::DNS::Resolver->new;
+my (@no_enum, %not_local, $num_external, $num_noenum);
+foreach my $phone_rec (@$voip_sel) {
+    my ($phone) = @$phone_rec;
+    my $phone_query = $phone;
+
+    # strip anything that's not a digit
+    $phone_query =~ s/\D//g;
+
+    # prefix the default area code if the number is only 7 digits
+    $phone_query = DEF_AREACODE.$phone_query if length($phone_query) == 7;
+
+    # prefix a 1 to the number if it's only 10 digits
+    $phone_query = '1'.$phone_query if length($phone_query) == 10;
+
+    # generate an enum version of the phone number for the dns query
+    # e.g. 808-555-1234 becomes 4.3.2.1.5.5.5.8.0.8.1.e164.arpa
+    my $query_rec = join('.', reverse split('', $phone_query)). '.e164.arpa';
+
+    #print "checking $phone...\n";
+
+    # look up the the NAPTR record for the phone number and warn if it
+    # doesn't exist
+    $query = $res->query($query_rec, 'NAPTR');
+    if (! $query) {
+        push @no_enum, $phone_query;
+        next;
+    }
+
+    # for practical purposes, i only expect a single record to be returned,
+    # but in case there are more we need to loop through them all
+    foreach my $naptr (grep { $_->type eq 'NAPTR' } $query->answer) {
+
+        # transform the given phone number according to the substitution
+        # specified in the NAPTR's regexp field.
+        # compare the results with our local-number pattern and print a
+        # warning if there's no match.
+        my $redir = $phone_query;
+        my ($junk, $naptr_pat, $naptr_subst) = split(/!/, $naptr->regexp);
+        $redir =~ s!$naptr_pat!$naptr_subst!;
+        if ($redir !~ ENUM_LOCAL_PAT) {
+            #print "$phone is not local; redirects to $redir\n";
+            $not_local{$phone} = $redir;
+            next;
+        }
+    }
+}
+
+
+# print a summary of our auditing above
+$num_external = scalar keys %not_local;
+$num_noenum = scalar @no_enum;
+print <<EOsummary;
+Summary:
+    $num_external numbers were found directing calls to external locations.
+    $num_noenum numbers were found without ENUM records.
+
+The external numbers should be removed from the VoIP service pool or
+deactivated in the voip database.  The missing ENUM records should
+be added to DNS, or their phone numbers should be deactivated in the
+voip database; suggested records and zone files are given below.
+
+EOsummary
+
+
+if ($num_external) {
+    print "Phone numbers redirected to external destinations:\n";
+    foreach my $phone (keys %not_local) {
+         printf "    %-10d  =====>  %s\n", $phone, $not_local{$phone};
+    }
+
+    print "\n";
+}
+
+
+@no_enum2 = sort @no_enum;
+while (@no_enum2) {
+    my @printset = splice(@no_enum2, 0, 3);
+format STDOUT_TOP = 
+Missing ENUM records:
+.
+    format STDOUT =
+    @>>>>>>>>>>         @>>>>>>>>>>         @>>>>>>>>>>         @>>>>>>>>>>
+    @printset
+.
+
+    write;
+}
+
+# print sample NAPTR records for all the missing numbers,
+# suitable for copy-and-paste
+if (@no_enum) { 
+    my (%phones_npa, @phones_other);
+
+    print "\n". ('='x80). "Sample ENUM records for your convenience:\n";
+
+    # first we want to organize them by area code
+    foreach my $phone (@no_enum) {
+        # strip the leading 1 we added earlier if it's a regular long distance
+        # phone number (1 + 10-digits)
+        $phone =~ s/^1([2-9][0-9]{9})$/$1/;
+
+        # group the numbers by area code
+        if (length $phone == 10) {
+            my ($npa, $nxxx) = $phone =~ /^(\d\d\d)(\d+)/;
+            push @{ $phones_npa{$npa} }, $nxxx;
+        }
+        else {
+            push @phones_other, $phone;
+        }
+    }
+
+    # then we want to print the samples
+    foreach my $npa (keys %phones_npa) {
+        my $zone = join('.', split('', reverse $npa)). '.1.e164.arpa';
+        my $title = "---- for zone file $zone ";
+        my $title_fill = 80 - length $title;
+        $title = $title . '-'x$title_fill;
+        print "\n$title\n";
+        foreach my $phone (sort @{ $phones_npa{$npa} }) {
+            my $rec = sprintf(NAPTR_FMT, join('.', split('', reverse $phone)),
+                              $npa.$phone);
+            print "$rec\n";
+        }
+    }
+
+    foreach my $phone (@phones_other) {
+        print "\nunrecognized phone number formats; for other zone files:\n";
+        my $rec = sprintf(NAPTR_FMT, join('.', split('', reverse $phone)),
+                          $phone);
+        print "$rec\n";
+    }
+}
+
+END {
+    $voipdb->disconnect if $voipdb;
+}                                                             

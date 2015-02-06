@@ -1,0 +1,1028 @@
+#!/usr/bin/perl
+
+##
+## atactl:  maintain SIP account ATA information
+##
+## $Id: atactl,v 1.30 2007/07/16 20:59:52 shaug Exp $
+# 
+# This script knows how to do anything related to provisioning for a SIP
+# user's ATA information.
+# 
+# $Log: atactl,v $
+# Revision 1.30  2007/07/16 20:59:52  shaug
+# exit 1 when a --del operation fails
+#
+# Revision 1.29  2007/07/16 20:06:16  shaug
+# changed callerid char limit from 64 to 128 so it matches sipctl
+#
+# Revision 1.28  2007/02/13 20:19:57  root
+# added support for Grandstream GXV-3000 ATAs (needs to be tested more)
+#
+# Revision 1.27  2006/11/03 22:41:36  root
+# fixed bug in line2 option processing -- codec and callerid weren't being
+# properly recognized from the cmdline options in the %changes hash
+#
+# Revision 1.26  2006/08/04 23:22:42  root
+# had to add explicit support for Sipura model "spa-2102" in the input
+# sanity check block.
+#
+# Revision 1.25  2006/08/04 17:54:51  root
+# added the ATA::SPA2102 library, for provisioning Sipura SPA-2102s
+#
+# Revision 1.24  2006/06/16 23:01:21  shaug
+# print the full list of supported codecs
+#
+# Revision 1.23  2005/09/21 19:46:48  root
+# added more support codec types to include those used by the Sipuras and
+# Linksyses
+#
+# Revision 1.22  2005/07/29 21:28:30  root
+# fixed bug in dprint where level 0 msgs weren't shown without -v
+#
+# Revision 1.21  2005/07/26 18:36:22  root
+# took out some debugging code to print the changes during --mod
+#
+# Revision 1.20  2005/07/26 00:14:20  root
+# fail out if we're adding and the ata maker wasn't recognized
+#
+# Revision 1.15  2005/07/07 00:18:37  root
+# changed grandstream handytone-486 class to "ATA::Grandstream" (as it
+# was originally)
+#
+# Revision 1.14  2005/07/07 00:14:57  root
+# added support for vendor and model attributes
+# added support for Sipura SPA-2100 ATAs
+#
+# Revision 1.13  2005/06/24 00:55:05  root
+# MAJOR CHANGE:  atactl now uses oo libs to manage ATAs.
+# There's a generic class, ATA.pm, and subclasses for individual ATA
+# types:  SPA2000.pm and Grandstream.pm are the first.
+#
+# Revision 1.12  2005/04/12 22:09:57  root
+# reformatted the help mesg to be more clear
+#
+# Revision 1.11  2005/03/15 22:31:55  root
+# fixed --del so that the config and tftp files are removed
+#
+# Revision 1.10  2005/02/15 01:52:22  root
+# fixed but in the way atas were being reset
+#
+# Revision 1.6  2005/02/11 23:37:12  root
+# added the full revision history to the comment at the top
+#
+# Revision 1.5  2005/02/11 23:32:57  root
+# fixed some debugging messages
+# 
+# Revision 1.4 2005/02/11 23:27:20 root
+# renamed --reconfig to --reinit
+# added --regen so there's a way to create a binary config from the
+# existing text config rather than overwriting the text config all the time
+# 
+# Revision 1.3 2005/02/11 21:11:17 root
+# whoops, wrong name in $ME!
+# 
+# Revision 1.2 2005/02/11 02:01:28 root
+# first revision with any useful features to speak of
+# 
+# Revision 1.1 2005/02/09 23:12:29;  author: root;  state: Exp;
+# Initial revision
+# 
+##
+
+
+# shared libs
+use DBI;
+use Getopt::Long qw(:config no_ignore_case);
+use FileHandle;
+
+# local libs
+use lib qw(./lib);
+use ATA;
+use ATA::Grandstream;
+use ATA::GXV3000;
+use ATA::SPA2000;
+use ATA::SPA2100;
+use ATA::SPA2102;
+use ATA::WRT54GP2;
+
+use strict;
+use vars qw($ME $VERSION $Usage %Usage %Flags $Action $Keytype @CODECS);
+
+BEGIN {
+    $VERSION = '0.'. (split(' ', '$Id: atactl,v 1.30 2007/07/16 20:59:52 shaug Exp $'))[2];
+    $ME = 'atactl';
+    $| = 1;
+
+    # how do we connect to the ser db?
+    use constant SER_DSN => 'DBI:mysql:ser;'.
+                           'mysql_read_default_group=ser;'.
+                           'mysql_read_default_file=/usr/local/etc/my.cnf-voip';
+
+    # we use these to keep track of what kind of key we were given on the
+    # cmd line
+    use constant MAC_KEY   => 1;
+    use constant PHONE_KEY => 2;
+    use constant NO_KEY    => 3;
+
+    # what area code should we prefix is a 7-digit number is given?
+    use constant DEF_AREACODE => '808';
+
+    # what codecs do the ATAs support?
+    @CODECS = qw(G.711 G.723 G.726 G.728 G.729 ILBC PCMU PCMA
+                 G711u G711a G726-16 G726-24 G726-32 G726-40 G729a G723);
+
+    $Usage = <<EOusage;
+$ME:  maintain SIP account ATA information
+
+Usage:
+  $ME <action> [<opts>] <key>
+
+action:  --help, --man, --version,
+         --add, --del, --mod, --reinit, --regen, --reset, --show,
+         --models, --makers
+
+options: --nochange, --yes, --verbose, --debug,
+         --mac, --maker, --model, --password,
+         --line1 callerid='Name A' --line1 codec=<codec> --line1 phone=<number1>
+         --line2 callerid='Name B' --line2 codec=<codec> --line2 phone=<number2>
+
+key:  must be either a phone number or a MAC address
+
+Examples:
+  $ME --models
+  $ME -v --add --mac 000b82018d51 --maker Linksys --model WRT54GP2
+   --password 'admin_pass' 
+   --line1 phone=5551234 --line1 codec=G.723
+   --line2 phone=5556789 --line2 codec=G7.11
+
+  $ME -v --mod --password 'new_admin_pass' --line2 codec=G.723 000b82018d51
+  $ME --show 8085551234
+  $ME --reset 5551234
+
+See '$ME -v -h' (verbose help) for a more complete description.
+EOusage
+
+    $Usage{full} = <<EOusage;
+$ME:  maintain SIP account ATA information
+
+Usage:
+  $ME <action> [<opts>] <key>
+
+Actions:
+  --help        Show this usage text.
+  --man         Show the comprehensive documentation.
+  --version|-V  Show the version ($VERSION).
+
+  --add         Do everything to provision the ATA.  All the ATA info fields
+                are required.
+  --del         Do everything to deprovision the ATA identified by the key.
+  --mod         Change all the specified ATA info settings for the given key.
+  --reinit      Regenerate the text and binary config files for the ATA
+                using the data in the database.  Implies --reset.
+  --regen       Regenerate the binary config files for the ATA from the
+                existing text config.  Implies --reset.
+  --reset       Tell the ATA to reboot.
+  --show        Print all ATA info for the requested key.
+  --models      Print a list of recognized ATA device makers and model names.
+  --makers      Print a list of recognized ATA manufacturers
+
+Options:
+  --nochange|-n Don't actually create the accounts;
+                just show what would have been done.
+  --yes|-y      Don't ask, just say yes to everything.
+  --verbose|-v  Show details of progress (give more than once for more info).
+  --debug|-d    Show a lot of debugging info.
+
+  ATA info:
+  --macaddress  MAC address of ATA (usually on a sticker underneath the device)
+  --maker       The name of the ATA's manufacturer.  The list of recognized
+                makers can be retrieved with the '--makers' action.
+  --model       The name of this ATA maker's particular model.  Requires a
+                --maker option.  See also '--models'.
+  --password    Admin password used to log in to the ATA's web interface.
+
+  Per-line info:  prefix the settings below with --line1 or --line2.
+                E.g.  --line1 callerid=<str> --line1 codec=<name> etc.
+    phone=name    Phone number associated with the given line.
+    callerid=str  Telephone Caller ID as reported by the ATA.  Not kept in DB.
+    codec=name    Specify the call audio codec:
+                  @CODECS
+
+Key:
+  The key field must always be specified.  The script can tell if you're
+  giving a MAC address (12 alphanumeric characters, optionally separated
+  by colons or dots) or a username (which is just most likely going to
+  look like a 7- or 10-digit phone number; if 7 are provided, the 808 area
+  code will be automatically prefixed).
+EOusage
+}
+
+
+# first make sure we can connect to the databases.  exit if we can't.
+# note that the host, username, and password are all read from the config
+# file that's specified in the DSN.
+#my $serdb = DBI->connect(SER_DSN, '', '', { RaiseError => 1, AutoCommit => 0 });
+
+# handle the command-line
+my (%curinfo, %changes, $ata);
+process_cmdline(\$ata, \%curinfo, \%changes);
+
+# clean and valid input data
+if ($Keytype ne NO_KEY) {
+    check_input(\%curinfo, \%changes) or exit 1;
+}
+
+dprint(2, "$Action ...\n");
+
+
+##
+## Taking the requested action...
+##
+#
+# --add:  create a new DB entry and associated configs for a phone number's ATA
+#
+# 1) See if the new phone number already exists; fail if it does.
+# 2) Add the ATA information to the DB
+# 3) Create the text-based config file.
+# 4) If the ATA uses TFTP, create a binary config in the TFTP directory.
+if ($Action eq 'add') {
+    my $ok;
+
+    if (exists $changes{line1}->{phone} and
+        $ata->exists(phone => $changes{line1}->{phone})) {
+        print "Sorry, but a DB entry already exists for ".
+              $changes{line1}->{phone}. " [". $ata->mac. "].\n";
+        exit 1;
+    }
+    elsif (exists $changes{line2}->{phone} and
+        $ata->exists(phone => $changes{line2}->{phone})) {
+        print "Sorry, but a DB entry already exists for ".
+              $changes{line2}->{phone}. " [". $ata->mac. "].\n";
+        exit 1;
+    }
+
+    $ata->adminpass($changes{adminpass})          if $changes{adminpass};
+
+    # update ATA object line 1
+    $ata->phone($changes{line1}->{phone})
+     if $changes{line1}->{phone};
+    $ata->codec($changes{line1}->{codec})
+     if $changes{line1}->{codec};
+    $ata->callerid($changes{line1}->{callerid})
+     if $changes{line1}->{callerid};
+
+    # update ATA object line 2
+    $ata->phone2($changes{line2}->{phone})
+     if $changes{line2}->{phone};
+    $ata->codec2($changes{line2}->{codec})
+     if $changes{line2}->{codec};
+    $ata->callerid2($changes{line2}->{callerid})
+     if $changes{line2}->{callerid};
+
+    #print "debug:  changes =\n";
+    #foreach my $k (keys %changes) {
+    #    if (ref $changes{$k} eq 'HASH') {
+    #        print "    $k:\n";
+    #        foreach my $k2 (keys %{$changes{$k}}) {
+    #            print "        $k2 -> $changes{$k}->{$k2}\n";
+    #        }
+    #    }
+    #    else {
+    #        print "    $k -> $changes{$k}\n";
+    #    }
+    #}
+
+    dprint(0, "Initializing ATA data...");
+    $ok = $ata->init;
+    dprint(0, !$ok ? " failed.\n" : " done.\n");
+    exit 1 if !$ok;
+}
+#
+# --reinit:  rebuild all the configs for an ATA from the DB info
+#
+# This is essentially the same as --add, but the ATA's info must already
+# exist in the DB and the ATA is rebooted afterward.
+# 1) Check that the account and ATA MAC address are associated; fail if not.
+# 2) Recreate the text config using the DB data and the default config file.
+# 3) If the ATA uses TFTP, create the binary config and install it.
+# 4) Tell the ATA to reload its config.
+elsif ($Action eq 'reinit') {
+    my $ok;
+
+    if (! $ata->exists) {
+        print "There's no DB entry for ". $ata->phone. " [". $ata->mac. "].\n";
+        exit 1;
+    }
+
+    # before writing the ata data, update it with the new info if given
+    $ata->adminpass($changes{adminpass}) if exists $changes{adminpass};
+
+    # update ATA object line 1
+    $ata->phone($changes{line1}->{phone})
+     if $changes{line1}->{phone};
+    $ata->codec($changes{line1}->{codec})
+     if $changes{line1}->{codec};
+    $ata->callerid($changes{line1}->{callerid})
+     if $changes{line1}->{callerid};
+
+    # update ATA object line 2
+    $ata->phone2($changes{line2}->{phone})
+     if $changes{line2}->{phone};
+    $ata->codec2($changes{line2}->{codec})
+     if $changes{line2}->{codec};
+    $ata->callerid2($changes{line2}->{callerid})
+     if $changes{line2}->{callerid};
+
+    dprint(0, "Initializing ATA data...");
+    $ok = $ata->init;
+    dprint(0, !$ok ? " failed.\n" : " done.\n");
+    exit 1 if !$ok;
+
+    dprint(0, "Rebooting ATA...");
+    $ok = $ata->reset;
+    dprint(0, !$ok ? " failed.\n" : " done.\n");
+    exit 1 if !$ok;
+}
+#
+# --regen:  only generate the binary config from the current text config.
+#           As opposed to --reinit, this allows a custom text config file
+#           to be created that doesn't necessarily correspond to the data
+#           in the DB combined with the settings of the default text config.
+#
+# 1) Check that the account and ATA MAC address are associated; fail if not.
+# 2) Make sure that all the required ATA config info is available in the DB.
+#    Particularly, we need to know the admin password so we can reboot the
+#    ATA afterward.
+# 3) Build the binary config.
+# 4) Reboot the ATA so it loads the new config.
+elsif ($Action eq 'regen') {
+    my $ok;
+
+    if (! $ata->exists) {
+        print "There's no DB entry for ". $ata->phone. " with MAC ".
+              "[". $ata->mac. "].\n";
+        exit 1;
+    }
+
+    unless ($ata->phone and $ata->mac and $ata->adminpass) {
+        print "To rebuild an ATA config, you need a phone, a MAC, and the ".
+              "admin password.\n";
+        exit 1;
+    }
+
+    dprint(0, "ATA TFTP config...");
+    $ok = $ata->init_bin;
+    dprint(0, !$ok ? " failed.\n" : " done.\n");
+    exit 1 if !$ok;
+
+    dprint(0, "Rebooting ATA...");
+    $ok = $ata->reset;
+    dprint(0, !$ok ? " failed.\n" : " done.\n");
+    exit 1 if !$ok;
+}
+#
+# --reset:  simply tell an ATA to reboot.  This will probably make it
+#           to download a new config.
+#
+# 1) Check that the account and ATA MAC address are associated; fail if not.
+# 2) Reboot!
+elsif ($Action eq 'reset') {
+    my $ok;
+
+    if (! $ata->exists) {
+        print "There's no DB entry for ". $ata->phone. " with MAC ".
+              "[". $ata->mac. "].\n";
+        exit 1;
+    }
+
+    dprint(0, "Rebooting ATA...");
+    $ok = $ata->reset;
+    dprint(0, !$ok ? " failed.\n" : " done.\n");
+    exit 1 if !$ok;
+}
+#
+# --mod:  change ATA information in the DB and configs.  Note that the ATA
+#         is not reset.
+#
+# 1) Check that the account and ATA MAC address are associated; fail if not.
+# 2) Change info in the DB
+# 3) Modify and rebuilt the ATA's configs
+elsif ($Action eq 'mod') {
+    my $ok;
+
+    if (! $ata->exists) {
+        print "There's no DB entry for ". $ata->phone. " with MAC ".
+              "[". $ata->mac. "].\n";
+        exit 1;
+    }
+
+    dprint(0, "Changing ATA settings...");
+    $ata->adminpass($changes{adminpass}) if $changes{adminpass};
+
+    # update ATA object line 1
+    $ata->phone($changes{line1}->{phone})
+     if $changes{line1}->{phone};
+    $ata->codec($changes{line1}->{codec})
+     if $changes{line1}->{codec};
+    $ata->callerid($changes{line1}->{callerid})
+     if $changes{line1}->{callerid};
+
+    # update ATA object line 2
+    $ata->phone2($changes{line2}->{phone})
+     if $changes{line2}->{phone};
+    if ($changes{line2}->{codec}) {
+	print "changing line2 codec to ". $changes{line2}->{codec}. "\n";
+	$ata->codec2($changes{line2}->{codec});
+    }
+    $ata->callerid2($changes{line2}->{callerid})
+     if $changes{line2}->{callerid};
+
+    if ($changes{maker}) {
+        $ata->maker($changes{maker})
+         or die("Couldn't set maker to $changes{maker}.\n");
+    }
+
+    if ($changes{model}) {
+        $ata->model($changes{model})
+         or die("Couldn't set model to $changes{model}.\n");
+    }
+
+    if ($changes{mac}) {
+        if ($Keytype eq MAC_KEY) {
+            $ata->mac($changes{mac});
+        }
+        else {
+            print "You can only change a MAC address when you give a MAC ".
+                  "address as a key\n";
+            exit 1;
+        }
+    }
+
+    dprint(0, "Updating ATA configs...");
+    $ok = $ata->update;
+    dprint(0, !$ok ? " failed.\n" : " done.\n");
+    exit 1 if !$ok;
+}
+#
+# --del:  delete an ATA from the system
+#
+# 1) Check that the account and ATA MAC address are associated; fail if not.
+# 2) Remove the DB info.
+# 3) Remove the text and binary configs.
+elsif ($Action eq 'del') {
+    my $ok;
+
+    if (! $ata->exists) {
+        print "There's no DB entry for ". $ata->phone. " with MAC ".
+              "[". $ata->mac. "].\n";
+        exit 1;
+    }
+
+    if ($Keytype eq MAC_KEY) {
+        dprint(0, "Deleting ATA with MAC $curinfo{mac}.\n");
+        $ok = $ata->delete;
+    }
+    else {
+        dprint(0, "Deleting ATA line $curinfo{phone}.\n");
+        $ok = $ata->delete($curinfo{phone});
+    }
+    dprint(0, !$ok ? " failed.\n" : " done.\n");
+    exit 1 if !$ok;
+}
+#
+# --show:  print out all information about all ATAs associated either
+#          with a single MAC address or a single phone number.  The info
+#          is taken from the database, not the text configs.
+#
+elsif ($Action eq 'show') {
+    if ($Keytype eq MAC_KEY) {
+        if ($ata->exists) {
+            $ata->printcache;
+        }
+        else {
+            print "Sorry, but no ATAs match $curinfo{phone} [".
+                  join(', ', @{$curinfo{mac}}). "].\n";
+        }
+    }
+    else {
+        if ($ata->exists(phone => $curinfo{phone})) {
+            $ata->printcache;
+        }
+        else {
+            print "Sorry, but no ATAs match $curinfo{phone}.\n";
+        }
+    }
+
+    exit;
+    {
+        my @macs = ref $curinfo{mac} ? @{ $curinfo{mac} } : ( $curinfo{mac} )
+         or die("Sorry, but there are no phones matching the number ".
+                "$curinfo{phone}\n");
+
+        my ($ata, %atainfo);
+        $atainfo{phone}  = $curinfo{phone};
+        $atainfo{phone2} = $curinfo{phone2} if exists $curinfo{phone2};
+        $atainfo{debug}  = $Flags{verbose};
+        foreach my $m (@macs) {
+            dprint(0, "MAC address [$m]:\n");
+            $ata = new ATA(dsn => SER_DSN, mac => $m, %atainfo);
+            $ata->printcache;
+            print "\n";
+        }
+    }
+}
+elsif ($Action eq 'makers') {
+    my @makers = $ata->makers();
+    print "Recognized ATA makers:  @makers\n";
+}
+elsif ($Action eq 'models') {
+    my @models = $ata->models();
+    my ($maker, $model);
+    print "Recognized ATA models:\n";
+    printf "    Maker               Model\n";
+    printf "    ================    ================\n";
+    while (@models) {
+        $maker = shift @models;
+        $model = shift @models;
+        printf "    %-16s    %-16s\n", $maker, $model;
+    }
+}
+
+else {
+    die("Error:  I didn't understand action $Action\n");
+}
+
+
+END {
+    #$serdb->disconnect if $serdb;
+}                                                             
+
+
+##
+# process_cmdline($ata, $%curinfo, $%changes):
+# 
+# handle command-line options, parse the key, make sure we have all the info
+# we require, and unless we're adding, make sure the key maps to
+# an existing phone.  If a phone number is given as the key and it's only
+# 7 digits long, the default area code will be prefixed.
+# 
+# inputs:
+#   $curinfo - ref to array that will be filled with current ATA settings
+#   $changes - ref to array of changes to be made
+# requires:  @ARGV
+# results:   sets global %Flags and $Action, makes changes to $curinfo and 
+#            $changes, $curinfo will have a phone number and a MAC
+##
+sub process_cmdline
+{
+    my ($ata, $curinfo, $changes) = @_;
+    my ($key, $sql, $set_key_action, $set_nokey_action, $mac, $phone, $phone2,
+        $maker, $model, %atainit);
+
+    # an anonymous subroutine called by GetOptions to set the global $Action
+    # based on what the user says on the cmd line.
+    $set_key_action   = sub { $Action = $_[0]; };
+    $set_nokey_action = sub { $Action = $_[0]; $Keytype = NO_KEY; };
+
+    # handle the command-line
+    GetOptions('verbose|v+'          => \$Flags{verbose},
+               'version|V'           => \$Flags{version},
+               'help|h'              => \$Flags{help},
+               'man|m'               => \$Flags{man},
+               'nochange|n'          => \$Flags{nochange},
+               'yes|y'               => \$Flags{always_yes},
+               'debug|d+'            => \$Flags{debug},
+
+               'macaddress=s'        => \$changes->{mac},
+               'model=s'             => \$changes->{model},
+               'maker=s'             => \$changes->{maker},
+
+               'password=s'          => \$changes->{adminpass},
+
+               'line1=s%'            => \$changes->{line1},
+               'line2=s%'            => \$changes->{line2},
+               #'phone=s'             => \$changes->{phone},
+               #'callerid=s'          => \$changes->{callerid},
+               #'codec=s'             => \$changes->{codec},
+
+               'add'                 => $set_key_action,
+               'del'                 => $set_key_action,
+               'mod'                 => $set_key_action,
+               'show'                => $set_key_action,
+               'reset'               => $set_key_action,
+               'reinit'              => $set_key_action,
+               'regen'               => $set_key_action,
+               'models'              => $set_nokey_action,
+               'makers'              => $set_nokey_action,
+              )
+     or die($Usage);
+    if ($Flags{version}) {
+        print "$ME version $VERSION\n";
+        exit 0;
+    }   
+    elsif ($Flags{help}) {
+        if ($Flags{verbose}) {
+            print $Usage{full};
+        }
+        else {
+            print $Usage;
+        }
+        exit 0;
+    }   
+    elsif ($Flags{man}) {
+        use Pod::Usage; 
+        pod2usage(-verbose => 2, -exitval => 0);
+    }
+
+    $maker = $changes->{maker} if $changes->{maker};
+    $model  = $changes->{model}  if $changes->{model};
+
+    if ($Keytype ne NO_KEY and @ARGV < 1) {
+        if (exists $changes->{mac}) {
+            $key = $changes->{mac};
+        }
+        elsif (exists $changes->{line1}->{phone}) {
+            $key = $changes->{line1}->{phone};
+        }
+        elsif (exists $changes->{line2}->{phone}) {
+            $key = $changes->{line2}->{phone};
+        }
+        else {
+            print "Error:  Sorry, but a key is required.\n\n". $Usage;
+            exit 1;
+        }
+    }
+    else {
+        $key = $ARGV[0];
+    }
+
+    # make sure all inputs are set
+    if (!$Action) {
+        die("Error:  please give an action to take\n");
+    }
+
+    # figure out what kind of key we were given:
+    # does it look like a 12-digit alphanum, maybe separated by : or .?
+    if ($key =~ /^(\w{4}[:.]?\w{4}[:.]?\w{4})$/) {
+        # a mac addr!  pull the phone number from the db
+        my (@phones, $tmpata);
+
+        $Keytype = MAC_KEY;
+
+        $mac = $key;
+        $mac =~ s/[:.]//g;
+        $mac = lc $mac;
+        $curinfo->{mac} = $mac;
+        $tmpata = ATA->new(dsn => SER_DSN, mac => $mac);
+
+        if (exists $changes->{line1}->{phone}) {
+            $phone = $changes->{line1}->{phone};
+        }
+        elsif (exists $changes->{line2}->{phone}) {
+            $phone = $changes->{line2}->{phone};
+        }
+        else {
+            dprint(2, "Checking for phones belonging to $mac\n");
+            @phones = $tmpata->get_phones;
+            dprint(2, "Found:  ". join(' ', @phones). "\n");
+
+            if (! @phones) {
+                die("ERROR:  there are no phones matching MAC addr [$key].\n");
+            }
+            else {
+                $phone = $phones[0];
+            }
+        }
+        $curinfo->{phone} = $phone;
+        $tmpata->phone($phone);
+        $maker = $tmpata->maker unless $maker;
+        $model = $tmpata->model unless $model;
+    }
+    elsif ($key !~ /\D/ and length $key == 7 || length $key == 10) {
+        # a phone number!
+        my (@macs, $tmpata);
+
+        $Keytype = PHONE_KEY;
+
+        dprint(2, "Setting \$curinfo->{phone} to $key\n");
+        $phone = length $key == 7 ? DEF_AREACODE.$key : $key;
+        $curinfo->{phone} = $phone;
+
+        dprint(2, "Checking for MACs belonging to $phone\n");
+        $tmpata = ATA->new(dsn => SER_DSN, phone => $phone);
+        @macs = $tmpata->get_macs;
+        $curinfo->{nmacs} = scalar @macs;
+        dprint(2, "Found:  ". join(' ', @macs). "\n");
+
+        # figure out which mac addr we'll be working with.  if the user gave
+        # us one, figure that's it.
+        if ($changes->{mac}) {
+            $changes->{mac} = lc $changes->{mac};
+            dprint(2, "Using MAC [$changes->{mac}] to identify ".
+                      "$curinfo->{phone}'s ATA\n");
+            $mac = $changes->{mac};
+            $curinfo->{mac} = $mac;
+            $tmpata->mac($mac);
+            $maker = $tmpata->maker unless $maker;
+            $model = $tmpata->model unless $model;
+        }
+        elsif (@macs == 1) {
+            dprint(2, "Found a single MAC, [$macs[0]], to identify ".
+                      "$curinfo->{phone}'s ATA\n");
+            $mac = $macs[0];
+            $curinfo->{mac} = $mac;
+            $tmpata->mac($mac);
+            $maker = $tmpata->maker unless $maker;
+            $model = $tmpata->model unless $model;
+        }
+        elsif ($Action eq 'show') {
+            dprint(2, "Found multiple MACs, none singled out by request.\n");
+            $curinfo->{mac} = [ @macs ];
+        }
+        else {
+            die("ERROR:  Sorry, but there's more than one ATA registered ".
+                "with $curinfo->{phone}.\nPlease specify a MAC address.\n");
+        }
+
+        # make sure we already have a record for the MAC addr if we're
+        # not doing an add
+        if ($Action ne 'add' && $Action ne 'show' and !grep($curinfo->{mac},
+         @macs)) {
+            die("ERROR:  Sorry, but there's no ATA with MAC address [".
+                $curinfo->{mac}. "] matching $curinfo->{phone}\n");
+        }
+    }
+    elsif ($Keytype ne NO_KEY) {
+        die("ERROR:  Sorry, but that key doesn't look like a phone number ".
+            "or a MAC address.\n");
+    }
+
+    $maker = lc $maker;
+    $model = lc $model;
+    $phone2 = $changes->{line2}->{phone} if exists $changes->{line2}->{phone};
+
+    # set up some attributes we'll use when initializing the ATA object
+    dprint(2, "ATA init data:  mac $mac, phone $phone.\n");
+    $atainit{dsn} = SER_DSN;
+    $atainit{mac} = $mac;
+    $atainit{debug} = $Flags{debug};
+    if (exists $changes->{line1}->{phone}) {
+        $atainit{phone}     = $phone;
+        $atainit{codec}     = $changes->{line1}->{codec}
+                              if exists $changes->{line1}->{codec};
+        $atainit{callerid}  = $changes->{line1}->{callerid}
+                              if exists $changes->{line1}->{callerid};
+    }
+    if (exists $changes->{line2}->{phone}) {
+        $atainit{phone2}    = $phone2;
+        $atainit{codec2}    = $changes->{line2}->{codec}
+                              if exists $changes->{line2}->{codec};
+        $atainit{callerid2} = $changes->{line2}->{callerid}
+                              if exists $changes->{line2}->{callerid};
+    }
+
+    # initialize the ATA object with the keys we figured out above
+    if ($maker eq 'grandstream') {
+        if ($model eq 'handytone-486') {
+            dprint(2, "Creating Grandstream HandyTone-486 ATA\n");
+            $$ata = ATA::Grandstream->new(%atainit);
+        }
+        elsif ($model eq 'gxv-3000' or $model eq 'gxv3000') {
+            dprint(2, "Creating Grandstream GXV-3000 ATA\n");
+            $$ata = ATA::GXV3000->new(%atainit);
+        }
+        else {
+            dprint(2, "Grandstream ATA model not recognized.\n");
+            die("Sorry, but this model of Grandstream ATA is not ".
+                "recognized.\n");
+        }
+    }
+    elsif ($maker eq 'sipura') {
+        dprint(2, "Checking for Sipura model $model\n");
+        if ($model eq 'spa-2000') {
+            dprint(2, "Creating Sipura SPA2000 ATA\n");
+            $$ata = ATA::SPA2000->new(%atainit);
+        }
+        elsif ($model eq 'spa-2100') {
+            dprint(2, "Creating Sipura SPA2100 ATA\n");
+            $$ata = ATA::SPA2100->new(%atainit);
+        }
+        elsif ($model eq 'spa-2102') {
+            dprint(2, "Creating Sipura SPA2102 ATA\n");
+            $$ata = ATA::SPA2102->new(%atainit);
+        }
+        else {
+            dprint(2, "Sipura ATA model not recognized.\n");
+            die("Sorry, but this model of Sipura ATA is not recognized.\n");
+        }
+    }
+    elsif ($maker eq 'linksys') {
+        if ($model eq 'wrt54gp2') {
+            dprint(2, "Creating Linksys WRT54GP2 ATA\n");
+            $$ata = ATA::WRT54GP2->new(%atainit);
+        }
+        else {
+            dprint(2, "Linksys ATA model not recognized.\n");
+            die("Sorry, but this model of Linksys ATA is not recognized.\n");
+        }
+    }
+    else {
+	# if we're adding and a recognized ATA wasn't specified, we must fail
+	if ($Action eq 'add') {
+	    die("ERROR:  Sorry, but that model is not recognized.\n".
+	        "Please see \"$ME --models\".\n");
+	}
+        #my $maker = ATA::guess_maker($mac);
+        dprint(2, "Creating generic ATA\n");
+        $$ata = ATA->new(%atainit);
+    }
+
+    $curinfo->{adminpass} = $$ata->adminpass;
+    $curinfo->{codec} = $$ata->codec;
+    $curinfo->{sippass} = $$ata->sippass;
+    $curinfo->{callerid} = $$ata->callerid;
+    if ($phone2) {
+        $curinfo->{codec2} = $$ata->codec2;
+        $curinfo->{sippass2} = $$ata->sippass2;
+        $curinfo->{callerid2} = $$ata->callerid2;
+    }
+
+    dprint(2, "Working with ATA ".$$ata->mac." for phone ". $$ata->phone."\n");
+    dprint(2, "... 2nd line is $phone2.\n") if $phone2;
+}
+
+
+##
+# check_input($%curinfo, $%changes):
+# 
+# verify sanity of all the options passed to the script
+# 
+# inputs:
+#   $curinfo - ref to hash of existing ATA settings
+#   $changes - ref to hash of ATA settings to be changed
+##
+sub check_input
+{
+    my ($curinfo, $changes) = @_;
+    my $phone = $curinfo->{phone};
+
+    # phone number:  strip out extra chars like - and ., then make sure
+    # it's NXX-NXX-XXXX or prefix 808.
+    dprint(2, "Checking sanity of phone $curinfo->{phone}\n");
+    $phone =~ s/[.() -]//g;
+    if ($phone =~ /\D/ or (length $phone != 7 and length $phone != 10)) {
+        warn('Error:  a phone number must only have 7 or 10 digits '.
+             '('. DEF_AREACODE. " area code is the default).\n");
+        return 0;
+    }
+
+    # MAC addr:  first strip separator chars from MAC addr
+    #            then make sure it's a alphanumeric & exactly 12 chars long
+    if ($changes->{mac}) {
+        dprint(2, "Checking sanity of MAC $changes->{mac}\n");
+        $changes->{mac} =~ s/[:.-]//g;
+        if ($changes->{mac} =~ /[^[:alnum:]]/ or length($changes->{mac}) != 12){
+            warn("Error:  MAC address must be 12 alphanumeric characters.  ".
+                 ": . and - are ignored.\n".
+                 "E.g.:  08:00:20:a9:1e:e8 or 0800.20a9.1ee8\n");
+            return 0;
+        }
+    }
+
+    # caller ID:  it can be anything, but let's keep it under 64 chars
+    if ($changes->{callerid}) {
+        if (length($changes->{callerid}) > 128) {
+            warn("error:  Caller ID must be less than 128 characters\n");
+            return 0;
+        }
+    }
+
+    # admin config password:  it can be anything, but let's keep it under
+    # 256 chars
+    if ($changes->{adminpass}) {
+        if (length($changes->{adminpass}) > 256) {
+            warn("error:  SIP password must be less than 256 characters\n");
+            return 0;
+        }
+    }
+
+    # codec:  make sure it matches one of the known codecs
+    if ($changes->{codec}) {
+        dprint(2, "Checking sanity of codec $changes->{codec}\n");
+        $changes->{codec} = uc $changes->{codec};
+        unless (grep($changes->{codec}, @CODECS)) {
+            warn("Error:  codec $changes->{codec} does not exist.  Please ".
+                 "select from one of the following:\n".  join(', ', @CODECS).
+                 "\n");
+            return 0;
+        }
+    }
+
+    return 1;
+}
+
+
+##
+# get_answer($prompt):
+# 
+# Print a question, get 'y' or 'n'.
+# returns:  0 on no, 1 on yes.
+##
+sub get_approval
+{
+    my $prompt = shift;
+    my $status = 0;
+    my $ok;
+
+    if ($Flags{nochange}) {
+        print "$prompt (y/n; changes disabled)  ";
+    }
+    else {
+        print "$prompt (y/n)  ";
+    }
+
+    if ($Flags{always_yes}) {
+        print "Presuming yes.\n";
+        $status = 1;
+    }
+    else {
+        while (defined($ok = <STDIN>) and $ok !~ /(y|yes|n|no|q|quit)$/i) {
+            print "Sorry, I didn't understand that.  Please answer (y)es, ".
+                  "(n)o, or (q)uit:  ";
+        }
+        if ($ok =~ /^y/i) {
+            $status = 1;
+        }
+        elsif ($ok && $ok =~ /^q/i) {
+            die("Exiting at your request.\n");
+        }
+        else {
+            $status = 0;
+        }
+    }
+
+    return $status;
+}
+
+
+##
+# dprint($level, $mesg):
+# 
+# Print the given message if the verbosity level is above $level.
+##
+sub dprint
+{
+    my ($level, $mesg) = @_;
+
+    if ($level == 0) {
+        print "$mesg";
+    }
+    elsif ($Flags{verbose} > $level) {
+        print '[D'. $level. '] '. $mesg;
+    }
+}
+
+
+##
+# do_sql($template, $want_data, @data):
+# 
+# Execute the SQL statement in $template with @data as the values.
+# 
+# returns:  if want_data is nonzero, returns the 1st array of data on success.
+#   otherwise, returns 1 on success.  returns 0 on failure.
+##
+# sub do_sql
+# {
+#     my ($template, $want_data, @data) = @_;
+#     my ($sql, @fetched);
+# 
+#     $sql = $serdb->prepare($template)
+#      or die("ERROR:  SQL statement is misconfigured:  ". $sql->errstr);
+#     if ($Flags{nochange}) {
+#         return 1;
+#     }
+#     else {
+#         dprint(3, "SQL:  $template\n");
+#         dprint(3, "Data:  ". join(', ', @data). "\n\n");
+#         $sql->execute(@data);
+#         if ($sql->err) {
+#             print STDERR "ERROR:  ". $sql->errstr. "\n";
+#             return 0;
+#         }
+#     }
+# 
+#     # if we got more than one row of data, unpack it all into an array
+#     # and return that array
+#     if ($want_data) {
+#         foreach my $aref (@{ $sql->fetchall_arrayref() }) {
+#             push @fetched, @{ $aref };
+#         }
+# 
+#         return @fetched;
+# 
+#     }
+#     else {
+#         return 1;
+#     }
+# }
+##

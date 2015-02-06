@@ -1,0 +1,441 @@
+#!/usr/bin/env python -dt
+
+##
+# magilla:  exercise the MGCP stack on a server using various protocol methods.
+# 
+# Options:
+#     -d|--daemon                 Run in client-daemon mode, listening on
+#                                 port 2427.
+#     -e|--endpoint <endpoint>    MGCP endpoint of the request in user@domain
+#                                 format.  "Default is AALN/*@<gateway>".
+#     -l|--lines <N>              Number of phone lines we act like we serve in
+#                                 client-daemon mode.
+#     -g|--gateway <hostname|IP>  Destination for the MGCP request.  Required.
+#     -v|--verb <verb>            MGCP verb to send.
+#                                 Default is "AUEP".
+#     -p|--param <name>=<val>     Parameter to add to the MGCP command header;
+#                                 more than one may be specified, as
+#                                 appropriate to the given verb.
+#                                 Default is "".
+#     -N|--nagios                 Nagios mode:  exit 0 on success, 2 on error,
+#                                 and limit output to something Nagios will
+#                                 understand.
+#     -t|--timeout                Network request timeout, in seconds.
+#                                 Default is 30s.
+# 
+# Requires Python & scapy <http://www.secdev.org/projects/scapy/>
+# 
+# Credit goes to the authors of sipsak for making such a fantastic and
+# useful tool.
+# 
+# For more information:
+#     RFC 2705 -- http://www.ietf.org/rfc/rfc2705.txt
+#     RFC 3660 -- http://www.ietf.org/rfc/rfc3660.txt
+#     MGCP Overview -- http://www.protocols.com/pbook/VoIPFamily.htm#mgcp
+# 
+# $Id$
+##
+
+
+import sys
+from scapy import *
+from optparse import OptionParser
+
+
+#
+# set up the command-line processing and fill "options" and "args"
+# with parameters passed from the cmd line
+#
+conf.verb=0
+usage = '%prog [-dN] [-e endpoint] [-p param=val ...] [-v verb] [-V ...] (host|ip)'
+parser = OptionParser(description='exercise the MGCP stack on a server ' +
+                                  'using various protocol methods',
+                      usage=usage,
+                      version='0.1')
+parser.add_option('-d', '--daemon',
+                  dest='daemon',
+                  action='store_true',
+                  default=False,
+                  help='Run in client-daemon mode, listening on port 2427')
+parser.add_option('-e', '--endpoint',
+                  dest='mgcp_endpoint',
+                  action='append',
+                  default='',
+                  help='MGCP endpoint in user@domain format')
+parser.add_option('-g', '--gateway',
+                  dest='mgcp_gateway',
+                  help='MGCP gateway to which the request should be sent')
+parser.add_option('-l', '--lines',
+                  dest='lines',
+                  type=int,
+                  default=1,
+                  help='Number of lines faked for client-daemon mode replies')
+parser.add_option('-N', '--nagios',
+                  dest='nagios',
+                  action='store_true',
+                  default=False,
+                  help='Nagios mode:  exit codes and output are compatible ' +
+                       'with nagios plugin standards')
+parser.add_option('-p', '--param',
+                  dest='mgcp_param',
+                  action='append',
+                  default='',
+                  help='Optional parameter to add to the MGCP command header')
+parser.add_option('-t', '--timeout',
+                  dest='timeout',
+                  type=int,
+                  default=30,
+                  help='Timeout for the network request')
+parser.add_option('-v', '--verb',
+                  dest='mgcp_verb',
+                  default='AUEP',
+                  help='MGCP verb to send to the endpoint')
+parser.add_option('-V', '--verbose',
+                  dest='verbose',
+                  action='count',
+                  default=0,
+                  help='Verbosity level; give more than once to increase ' +
+                       'output')
+(options, args) = parser.parse_args()
+
+
+#
+# ensure that required options are set and set other defaults
+#
+
+# if something is left on the command-line, we take it in as the
+# MGCP gateway address.
+if len(args) > 0:
+    options.mgcp_gateway = args[0]
+
+# if we're in client-daemon mode:
+#   we may need to figure out a list of endpoints based on the number of
+#   lines requested at the command-line
+#   if any endpoints were given explicitly, we ignore the lines option
+#
+#if options.daemon:
+#    if not options.mgcp_endpoint:
+#        for l in range(1, options.lines+1):
+#            options.mgcp_endpoint.append('AALN/' + l)
+
+# if we're in client request mode, a few things are required:
+#   an MGCP gateway must be given
+#   an MGCP endpoint may be given or we will figure out a generic default
+#   by deriving one from the gateway address
+#
+if not options.daemon:
+    if not options.mgcp_gateway:
+        parser.error("Please provide an MGCP gateway hostname or IP (-g).")
+    if not options.mgcp_endpoint:
+        # figure out our MGCP endpoint by using the gateway we already have
+        if options.verbose > 1:
+            print "Deriving MGCP endpoint from gateway\n"
+        # we assume the MGCP endpoint is analog
+        options.mgcp_endpoint[0] = 'AALN/*@'
+        # if an IP was given for an endpoint, wrap it in brackets ("[a.b.c.d]")
+        if re.compile('[0-9\.]*$').match(options.mgcp_gateway):
+            options.mgcp_endpoint[0] += '[' + options.mgcp_gateway + ']'
+        # otherwise just append the name to the endpoint address
+        else:
+            options.mgcp_endpoint[0] += options.mgcp_gateway
+
+parser.destroy()
+
+if options.verbose > 0:
+    if options.daemon:
+        print "Listening in client-daemon mode"
+        for e in options.mgcp_endpoint:
+            print "MGCP endpoint:             " + str(e)
+        if options.lines:
+            print "Automatic endpoint lines:  " + str(options.lines)
+    else:
+        print "Generating single request for MGCP client"
+        print "MGCP gateway:              " + str(options.mgcp_gateway)
+        for e in options.mgcp_endpoint:
+            print "MGCP endpoint:             " + str(e)
+        print "MGCP verb:                 " + str(options.mgcp_verb)
+        print "Request timeout:           " + str(options.timeout)
+        if options.mgcp_param:
+            print "MGCP parameters:\n"
+            for p in options.mgcp_param:
+                print "    $p"
+    print ""
+
+
+#
+# MGCPx:  create a new Packet subclass that will be used to extend MGCP
+# by adding a layer for optional command header fields.
+# See http://www.ietf.org/rfc/rfc2705.txt, section 3.2.2
+#
+class MGCPx(Packet):
+    #name = "MGCPx" 
+    name = "MGCP parameters" 
+    longname = ('Media Gateway Control Protocol, with support for request ' +
+                'parameters')
+
+                    
+    fields_desc = [ FieldLenField("len", None, "parameters"),
+                    FieldListField("parameters", [],
+                                   #StrStopField("parameter", "\x0a", -1), "len")
+                                   StrStopField("parameter", "\r\n", -1), "len")
+                    # for the next scapy rev:
+                    #FieldLenField("nparams", 0, count_of="parameters")
+                  ]
+    #fields_desc = [ StrStopField("parameter", "\r\n", -1) ]
+
+# bind our extended MGCPx class to the MGCP class
+bind_layers(MGCP, MGCPx)
+
+
+#
+# mgcp_monitor:  callback function that returns a string whenever an
+# MGCP protocol layer is found in the given packet
+#
+def mgcp_monitor(pkt):
+    msg = ''
+    if MGCP in pkt:
+        msg.append(pkt.sprintf("%MGCP.verb% %MGCP.endpoint%"))
+    if MGCPx in pkt:
+        msg.append(pkt.sprintf(" %MGCPx.parameters%"))
+    return msg
+
+
+# def make_test(endpoint, verb):
+#     return Ether()/IP()/Test(endpoint=e, verb=v)
+# 
+# if __name__ == "main"
+#     interact(mydict=globals(), mybanner="MGCP testing add-on v0")
+
+
+#
+# if we're a daemon, create a listening socket on port 2427, then
+# listen for requests and reply accordingly
+#
+if options.daemon:
+    if options.verbose:
+        print ("Scanning for traffic on port 2427...")
+    #conf.L3socket = L3RawSocket
+    sock = conf.L3socket(filter="udp dst port 2427")
+
+    while 1:
+        try:
+            recv = sock.recv()
+            if recv:
+                print ("Received query from " + str(recv.src))
+                if options.verbose > 1:
+                    print recv.sprintf("    %MGCP.verb% %MGCP.transaction_id% "
+                                       "%MGCP.endpoint% %MGCP.version%")
+                    if recv[MGCPx]:
+                        print recv.sprintf("    %MGCPx.parameters%")
+
+                # initiate our reply packet with an IP layer from the
+                # received packet's source address and a UDP layer that
+                # returns back to the received's source port, sent from
+                # the received's destination port
+                reply = IP(dst=recv[IP].src)
+                reply = reply/UDP(dport=recv[UDP].sport,
+                                  sport=recv[UDP].dport)
+
+                # generate a reply appropriate to the request type:
+                # (see RFC 2704, section 3.2.1.1, "Coding of the requested
+                # verb"; parameters are described in 3.2.2, "Parameter lines")
+
+                # ... AuditConnection
+                if recv[MGCP].verb == "AUCX":
+                    raise "Request not supported"
+
+                # ... AuditEndpoint
+                elif recv[MGCP].verb == "AUEP":
+                    # reply with "200 <trans_id> OK"
+                    reply = reply/MGCP(verb="200 " +
+                                            str(recv[MGCP].transaction_id) +
+                                            " OK",
+                                       transaction_id='',
+                                       endpoint='',
+                                       version='')
+
+                    # add a Z parameter ("SpecificEndpointID") that identifies
+                    # the endpoints located here.  if a specific endpoint was
+                    # requested, just return that.  if a wildcard endpoint was
+                    # requested, return OK for as many as were provided via the
+                    # command line
+                    reply = reply/MGCPx(parameters = [])
+                    if re.compile(r"\*").match(recv[MGCP].endpoint):
+                        if options.verbose > 1:
+                            print "replacing '*' in request with endpoints"
+                        if options.mgcp_endpoint:
+                            for e in options.mgcp_endpoint:
+                                reply[MGCPx].parameters.append("Z: " + e)
+                        else:
+                            for l in range(options.lines):
+                                endpoint = re.sub(r"\*", str(l+1),
+                                                  recv[MGCP].endpoint)
+                                reply[MGCPx].parameters.append("Z: " + endpoint)
+                    else:
+                        reply[MGCPx].parameters.append("Z: " + 
+                                                       recv[MGCP].endpoint)
+
+                # ... CreateConnection
+                elif recv[MGCP].verb == "CRCX":
+                    # reply with "200 <trans_id> OK" followed by
+                    # an I parameter with a new connection id
+
+                    # generate a random int for the connection ID
+                    # RFC 2705 says it can be a 32-character hex string,
+                    # but ints are adequate
+                    conn_id = random.randint(1, 65536)
+                    print "Creating new connection: " + conn_id
+                    connections[conn_id] = recv;
+
+                    reply = reply/MGCP(verb="200 " +
+                                            str(recv[MGCP].transaction_id) +
+                                            " OK",
+                                       transaction_id='',
+                                       endpoint='',
+                                       version='')
+                    reply = reply/MGCPx(parameters=["I:" + conn_id])
+
+                # ... DeleteConnection
+                elif recv[MGCP].verb == "DLCX":
+                    # pull the connection ID parameter from the MGCP packet
+                    # and delete that connection, then return "250 OK" if
+                    # successful
+                    if recv[MGCPx].parameters:
+                        for p in recv[MGCPx].parameters:
+                            match = re.match(r"^I: (.*)$", p.str)
+                            if match:
+                                conn_id = match.group(1)
+
+                    if conn_id and connections[conn_id]:
+                        del connections[conn_id]
+                        reply = reply/MGCP(verb="250 " +
+                                                str(recv[MGCP].transaction_id) +
+                                                " Connection was deleted",
+                                           transaction_id='',
+                                           endpoint='',
+                                           version='')
+                    else:
+                        reply = reply/MGCP(verb="515 " +
+                                                str(recv[MGCP].transaction_id) +
+                                                " Connection " + conn_id +
+                                                " does not exit",
+                                           transaction_id='',
+                                           endpoint='',
+                                           version='')
+
+                # ... EndpointConfiguration
+                elif recv[MGCP].verb == "EPCF":
+                    raise "Request not supported"
+
+                # ... ModifyConnection
+                elif recv[MGCP].verb == "MDCX":
+                    # reply with "200 <trans_id> OK"
+                    reply = reply/MGCP(verb="200 " +
+                                            str(recv[MGCP].transaction_id) +
+                                            " OK",
+                                       transaction_id='',
+                                       endpoint='',
+                                       version='')
+
+                # ... Notify
+                elif recv[MGCP].verb == "NTFY":
+                    # reply with "200 <trans_id> OK"
+                    reply = reply/MGCP(verb="200 " +
+                                            str(recv[MGCP].transaction_id) +
+                                            " OK",
+                                       transaction_id='',
+                                       endpoint='',
+                                       version='')
+
+                # ... NotificationRequest
+                elif recv[MGCP].verb == "RQNT":
+                    # reply with "200 <trans_id> OK"
+                    # note that we ignore the X, R, S, Q, & T parameters
+                    reply = reply/MGCP(verb="200 " +
+                                            str(recv[MGCP].transaction_id) +
+                                            " OK",
+                                       transaction_id='',
+                                       endpoint='',
+                                       version='')
+
+                # ... RestartInProgress
+                elif recv[MGCP].verb == "RSIP":
+                    # reply with "200 <trans_id> OK"
+                    # note that we ignore the "ResponseMethod" parameter
+                    reply = reply/MGCP(verb="200 " +
+                                            str(recv[MGCP].transaction_id) +
+                                            " OK",
+                                       transaction_id='',
+                                       endpoint='',
+                                       version='')
+
+                else:
+                    raise "Request not supported"
+
+                # send our reply
+                if reply:
+                    if options.verbose:
+                        print ("Sending reply (max " + str(options.timeout) +
+                               "s)...")
+                    if options.verbose > 1:
+                        reply[MGCP].show()
+                        #if reply[MGCPx]:
+                        #    reply[MGCPx].show()
+                    send(reply)
+                
+                print "\n"
+
+        except "Request not supported":
+            print "MGCP verb " + recv[MGCP].verb + " not supported!"
+            # send a "512 <trans_id> <verb> not recognized" message
+            reply = reply/MGCP(verb="512 " +
+                                    str(recv[MGCP].transaction_id) + " " +
+                                    recv[MGCP].verb + " Not Supported",
+                               transaction_id='',
+                               endpoint='',
+                               version='')
+            if options.verbose:
+                print ("Sending reply...")
+            if options.verbose > 1:
+                reply[MGCP].show()
+                #reply[MGCPx].show()
+            send(reply)
+            print "\n"
+
+        except KeyboardInterrupt:
+            print "Exiting at user request."
+            sys.exit(0)
+
+
+#
+# if we're a creating a client probe, create an MGCP packet,
+# add command parameters for each given gateway, then send it
+# and print the results
+#
+else:
+    query = IP(dst=options.mgcp_gateway)/UDP(dport=2727, sport=2427)/MGCP(endpoint=options.mgcp_endpoint[0], verb=options.mgcp_verb)/MGCPx()
+    for p in options.mgcp_param:
+        if options.verbose > 1:
+            print "Adding command parameter " + p
+        query[MGCPx].parameters.append(p)
+
+    if options.verbose:
+        print ("Sending query, waiting for response (max " +
+               str(options.timeout) + "s for response)...")
+    ans,unans = sr(query, timeout=options.timeout)
+
+    # send the packet
+    if ans:
+        for send,recv in ans:
+            print "==== Sent:"
+            send[MGCP].show()
+            #send[MGCPx].show()
+            print "==== Received:"
+            recv[MGCP].show()
+            #recv[MGCPx].show()
+            print ""
+    else:
+        print "No reply."
+
+# monitor for MGCP packets
+#sniff(prn=mgcp_monitor, filter="mgcp", store=0)

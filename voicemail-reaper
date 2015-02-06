@@ -1,0 +1,379 @@
+#!/usr/bin/perl -w
+
+##
+# voicemail-reaper:  remove obsolete Asterisk voicemail boxes based on
+#                    a list of accounts in the database.
+# 
+# The cleanup procedure runs like this:
+#     - Read a list of voicemail boxes from the database.
+#     - Scan through the asterisk voicemail spool directory for mailboxes
+#       that aren't listed in the db.
+#     - Move those boxes to a delete queue
+#     - A separate process will search the delete queue for mailboxes over
+#       a certain age and remove them.  This gives us a window where
+#       voicemail boxes can be recovered.
+#     - Run with "--help" to see usage information.
+# 
+# $Id: voicemail-repear:15:24 shaug Exp $
+##
+
+
+#use strict;
+use IO::File;
+use Getopt::Long;
+use DBI;
+use POSIX qw(strftime);
+use Date::Manip qw(ParseDate UnixDate);
+use File::Copy;
+use vars qw($ME $VERSION $Usage %Flags %DBINFO $AstDB $Context $Cutoff @Ignore);
+
+
+BEGIN {
+    $ENV{PATH} = '/usr/local/bin:/usr/bin:/bin';
+
+    $VERSION = '0.'. (split(' ', '$Id: voicemail-repear,v 1.10 2006/10/13 20:15:24 shaug Exp $'))[2];
+    $ME = 'voicemail-reaper';
+
+    # where does Asterisk keep its voicemail messages?
+    use constant AST_VM_SPOOL   => '/var/spool/asterisk/voicemail';
+    use constant AST_INBOX      => 'INBOX';
+    use constant AST_VM_ARCHIVE => '/var/spool/asterisk/voicemail-archive';
+
+    # database connection and usage info
+    use constant MYSQL_CNF => '/usr/local/etc/my.cnf-voip';
+
+    %DBINFO = (
+        # how to we connect to the various databases?
+        AST_DSN    => 'DBI:mysql:asterisk;mysql_read_default_file='. MYSQL_CNF.
+                      ';mysql_read_default_group=asterisk',
+
+        # voicemail status table queries
+        VM_LIST    => 'SELECT distinct mailbox FROM users order by mailbox',
+    );
+
+    # how long ago must a box have changed to be removed?
+    $Cutoff = '1 week ago';
+
+    # what's the default Asterisk context?
+    $Context = 'default';
+
+    # how are we called?
+    $Usage = <<EOusage;
+$ME:  remove any obsolete voicemail accounts
+
+Usage:
+     $ME [<opts>] [-nr] [--context <name>] [--date <date string>]
+
+Options:
+  --help              Show this usage text.
+  --man               Show the comprehensive documentation.
+  --verbose|-v        Show details (give more than once for more info).
+  --version           Show the version ($VERSION).
+  --nochange|-n       Don't make any changes; just show what would be done.
+  --remove|-r         Remove old mailboxes instead of moving them to the
+                      delete queue.
+  --context|-c <str>  Specify an asterisk context other than "$Context".
+  --date|-d <str>     Specify a cutoff date for removing mailboxes; if the
+                      box has been changed more recently than the given date
+                      it won't be removed.  Default is "$Cutoff".
+  --ignore|-i <box>   Don't archive the given mailbox; may be used more than
+                      once.
+
+The Asterisk voicemail boxes on the filesystem are compared with the
+list of asterisk accounts in the database and any boxes that aren't in
+the db are removed.  The date cutoff field is parsed with a smart date
+string interpreter.  The format is intuitive, but if you need more
+information, see "perldoc Date::Manip", particularly the "EXAMPLES"
+and "ParseDateString" sections.
+EOusage
+
+    $| = 1;
+}
+
+
+# handle the command-line
+$Flags{verbose} = 0;
+GetOptions('verbose|v+' => \$Flags{verbose},
+           'version'    => \$Flags{version},
+           'help'       => \$Flags{help},
+           'man'        => \$Flags{man},
+           'context=s'  => \$Context,
+           'date=s'     => \$Cutoff,
+           'ignore=s'   => \@Ignore,
+           'nochange|n' => \$Flags{nochange},
+           'remove|r'   => \$Flags{remove}
+          )
+ or die($Usage);
+if ($Flags{version}) {
+    print "$ME version $VERSION\n";
+    exit 0;
+}
+elsif ($Flags{help}) {
+    print $Usage;
+    exit 0;
+}
+elsif ($Flags{man}) {
+    use Pod::Usage;
+    pod2usage(-verbose => 2, -exitval => 0);
+}
+
+if ($Cutoff) {
+    ParseDate($Cutoff)
+     or die("Error:  couldn't understand the cutoff date \"$Cutoff\".\n".
+            "Please see http://search.cpan.org/~sbeck/DateManip-5.44/".
+            "Manip.pod#ROUTINES,\nunder the ParseDateString documentation.\n");
+}
+
+# first make sure we can connect to the asterisk db.  if we can't, exit.
+$AstDB = DBI->connect($DBINFO{AST_DSN}, '', '', { RaiseError => 1,
+         AutoCommit => 0 });
+
+
+my (@spooldirs, @subscribers, @obsolete);
+
+# pull a list of mailboxes from the asterisk database
+@subscribers = do_sql($AstDB, $DBINFO{VM_LIST}, 2);
+dprint(0, 'Found '. scalar @subscribers. 
+          " subscribers in the Asterisk database.\n");
+
+# read the list of asterisk mailbox directories
+@spooldirs = read_voicemail_dirs($Context, $Cutoff);
+dprint(0, 'Found '. scalar @spooldirs. ' Asterisk voicemail spools untouched '.
+          "since $Cutoff.\n");
+dprint(3, "Matching spools:  @spooldirs\n");
+
+# find out which mailbox dirs don't belong to current subscribers
+@obsolete = diff_lists(\@subscribers, \@spooldirs);
+dprint(0, sprintf("%d %s obsolete\n", scalar @obsolete,
+                  @obsolete == 1 ? 'spool is' : 'spools are'));
+
+# take the obsolete mailboxes out of the spool directory for the given context
+retire_mailboxes($Context, \@obsolete);
+
+
+# read_subscribers($db_handle, $subscribers_arrayref):
+#   read a list of asterisk mailboxes into the given array reference
+sub read_subscribers
+{
+    my ($dbh, $sublist) = shift;
+    my ($sub_sel);
+
+    # prepare SQL statements for working with the ser group table.
+    # the ?'s get filled in at runtime
+    $sub_sel = $dbh->prepare($DBINFO{VM_LIST});
+
+    $sub_sel->execute();
+    foreach my $ref (@{$sub_sel->fetchall_arrayref()}) {
+        push @$sublist, @$ref;
+    }
+    $sub_sel->finish();
+}
+
+
+# read_voicemail_dirs($context, $cutoff):
+#     read all the voicemail directories in the asterisk spool dir for the
+#     given context where no new mail has been left since the given cutoff
+sub read_voicemail_dirs
+{
+    my ($context, $cutoff) = @_;
+    my ($spooldir, @spooldirs);
+    local (*VMSPOOL);
+
+    $spooldir = AST_VM_SPOOL. '/'. $context;
+    chdir($spooldir) && opendir(VMSPOOL, $spooldir)
+     or die("couldn't open the Asterisk spool dir,\n$spooldir:\n$!\n");
+    rewinddir(VMSPOOL);
+    @spooldirs = sort grep { /^\w+$/ && -d $_ } readdir(VMSPOOL);
+    closedir(VMSPOOL);
+
+    if ($cutoff) {
+        my (@cutoff_dirs, $lastmod, $inbox);
+        my $cutoff_secs = UnixDate(ParseDate($cutoff), '%s');
+
+        dprint(2, "searching for spools unused since $cutoff:\n");
+        dprint(2, sprintf("%40s  %-19s (%10ds)\n",
+                  'cutoff:  inboxes unmodified since',
+                  strftime('%F %T', localtime $cutoff_secs), $cutoff_secs));
+        foreach my $dir (@spooldirs) {
+            $inbox = $dir.'/'.AST_INBOX;
+            if (! -d $inbox) {
+                print "$dir is corrupted; ignoring\n";
+                next;
+            }
+
+            $lastmod = (stat($inbox))[9];
+            if ($lastmod < $cutoff_secs) {
+                dprint(2, sprintf("!%39s  %-19s (%-10ds)\n",
+                       "$dir last changed at:",
+                       strftime('%F %T', localtime $lastmod),
+                       $lastmod));
+                push @cutoff_dirs, $dir;
+            }
+            else {
+                dprint(2, sprintf("%40s  %-19s (%-10ds)\n",
+                       "$dir last changed at:",
+                       strftime('%F %T', localtime $lastmod),
+                       $lastmod));
+            }
+        }
+
+        @spooldirs = @cutoff_dirs;
+    }
+
+    return @spooldirs;
+}
+
+
+# diff_lists($list1, $list2):
+#   compare $list1 with $list2 and return an array with those elements
+#   of $list2 that are not in $list1
+sub diff_lists {
+    my ($list1, $list2) = @_;
+    my (%list1, @missing);
+
+    # make list1 easy to look up
+    foreach (@$list1) {
+        $list1{$_} = 1;
+    }
+
+    foreach (@$list2) {
+        push @missing, $_ unless $list1{$_};
+    }
+
+    return @missing;
+}
+
+
+# retire_mailboxes($context, $list):
+#   for each mailbox that's listed in the arrayref $list, either move it to
+#   the disabled mailbox directory or remove it altogether from the system.
+#   fakes it if $Flags{nochange} is set.
+sub retire_mailboxes
+{
+    my ($context, $boxlist) = @_;
+    my ($spooldir, $archivedir);
+    #local (*ARCHIVE);
+
+    $spooldir = AST_VM_SPOOL. '/'. $context;
+    chdir($spooldir) 
+     or die("couldn't chdir to the Asterisk spool dir,\n$spooldir:\n$!\n");
+
+    $archivedir = AST_VM_ARCHIVE. '/'. $context;
+    if (!$Flags{nochange} and !$Flags{remove} and !-d $archivedir) {
+        dprint(0, "Mailbox archive directory $archivedir does not exist; ".
+                  "creating\n");
+        mkdir($archivedir, 0755) or die("couldn't create $archivedir: $!\n");
+    }
+
+    dprint(1, "Ignoring these mailboxes:  @Ignore\n") if @Ignore;
+    foreach my $box (@$boxlist) {
+        dprint(1, "Retiring \"$box\"... ");
+
+        # this can be dangerous, so doublecheck the filename before we continue
+        if ($box =~ /([.\/])/) {
+            print "I won't touch mailbox names that include \"$1\"; ".
+                  "ignoring.\n";
+            next;
+        }
+        
+        if (grep($_ eq $box, @Ignore)) {
+            dprint(1, "ignored.\n");
+            next;
+        }
+
+        if (-e "$archivedir/$box") {
+            print "$box already has an archive; ignoring\n";
+            next;
+        }
+
+        if ($Flags{nochange}) {
+            dprint(1, "system changes disabled.\n");
+        }
+        elsif ($Flags{remove}) {
+            my @out = `rm -rf $box 2>&1`;
+            if ($? != 0) {
+                chomp @out;
+                print STDERR 'removal failed: '. (@out ? $out[0] :
+                             'reason unknown' ). "\n";
+            }
+            else {
+                dprint(1, "removed.\n");
+            }
+        }
+        else {
+            move($box, "$archivedir/$box") or print STDERR "$box move failed: $!\n";
+            dprint(1, "archived.\n");
+        }
+    }
+}
+
+
+##
+# dprint($level, $mesg):
+# 
+# Print the given message if the verbosity level is above $level.
+##
+sub dprint
+{
+    my ($level, $mesg) = @_;
+
+    return unless $Flags{verbose} >= $level;
+
+    if ($level < 2) {
+        print "$mesg";
+    }
+    else {
+        print '[D'. $level. '] '. $mesg;
+    }
+}
+
+
+##
+# do_sql($dbh, $template, $want_data, @data):
+# 
+# Execute the SQL statement in $template with @data as the values.
+# 
+# returns:
+#   if want_data is 0, returns 1 on success.
+#   if want_data is 1, returns the 1st array of data on success.
+#   if want_data is 2, returns an array filled with the 1st element of
+#   each result array.
+#   returns 0 on failure.
+##
+sub do_sql
+{
+    my ($dbh, $template, $want_data, @data) = @_;
+    my ($sql);
+
+    $sql = $dbh->prepare($template)
+     or die("ERROR:  SQL statement is misconfigured:  ". $sql->errstr);
+    dprint(3, "\n\n");
+    dprint(3, "SQL:  $template\n");
+    dprint(3, "Data:  ". join(', ', @data). "\n\n");
+    $sql->execute(@data);
+    if ($sql->err) {
+        print STDERR "ERROR:  ". $sql->errstr. "\n";
+        return 0;
+    }
+
+    if ($want_data == 0) {
+        return 1;
+    }
+    elsif ($want_data == 1) {
+        return $sql->fetchrow_array();
+    }
+    elsif ($want_data == 2) {
+        my @result_data;
+        foreach my $ref (@{$sql->fetchall_arrayref()}) {
+            dprint(4, "Adding (@$ref) to return data... ");
+            push @result_data, @$ref;
+            dprint(4, "Return array is $#result_data elements long.\n");
+        }
+        return @result_data;
+    }
+}
+
+
+END {
+    $AstDB->disconnect if $AstDB;
+}
