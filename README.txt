@@ -33,3 +33,23 @@ Samples include:
                           longer active.
 
 All of these applications require supporting libraries or databases.
+
+
+### See also
+
+My repository in GitHub: https://github.com/oshaughnessy
+
+* https://github.com/oshaughnessy/mailmate-scripts
+  Scripts I've found handy to have when using MailMate
+
+* https://github.com/oshaughnessy/mailmate-macvim
+  The MacVim bundle for MailMate (http://freron.com)
+
+* https://github.com/oshaughnessy/squirrelmail-autorespond
+  A SquirrelMail plugin to manage .forward and .vacation files over FTP
+
+* https://github.com/oshaughnessy/trash-monkey
+  A pair of scripts to cleaning up mbox and Maildir-format mailboxes
+
+* https://github.com/oshaughnessy/sip-notify
+  Notify Asterisk SIP users when they have new voicemail
