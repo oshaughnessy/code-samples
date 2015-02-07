@@ -1,0 +1,8 @@
+# Replace every match of *.orig-domain.com in column 1
+# with the CNAME destination to which it refers.
+#
+# This was used in an haproxy map file, where I was using CNAMEs in our
+# own domain to send redirects to CloudFront. A temporary issue required
+# me to replace all our hostnames with their cloudfront.net equivalents.
+
+perl -ap -e '$F[1] =~ /\.orig-domain\.com$/ || next; $h=`host -t cname $F[1]`; $cf = ($h =~ /.* is an alias for (.*)\.$/)[0] or next; $_ =~ s/$F[1]$/$cf/' haproxy-cdns.map
