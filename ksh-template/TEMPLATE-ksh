@@ -23,11 +23,12 @@ set -o errexit
 set -o noglob
 
 # set up the environment
-ME=${0##*/}
-VERSION=$(set $Revision$; print $2)
-FIX="add more customizable variables here"
-USAGE="usage: $ME FIX - put usage info here"
-HELP=$(cat <<EOhelp
+readonly ME=${0##*/}
+# maintain your version string as you upgrade the code
+readonly VERSION=$(set $Revision$; print $2)
+readonly FIX="add more customizable variables here"
+readonly USAGE="usage: $ME FIX - put usage info here"
+readonly HELP=$(cat <<EOhelp
 $ME: FIX one-line description goes here
 
 Usage: $ME FIX usage info goes here
@@ -44,7 +45,7 @@ EOhelp)
 . $HOME/lib/libadm.sh
 
 # process the command line
-[[ "$1" = "--help" ]] && { perldoc -U -t -F $0; exit $EX_OK; }
+[[ "$1" == "--help" ]] && { perldoc -U -t -F $0; exit $EX_OK; }
 while getopts :FIX:vh opt; do
     case $opt in
     F)      : Change FIX:vh in the getopts call above and then act on ;;
@@ -58,7 +59,7 @@ while getopts :FIX:vh opt; do
                           "See '$ME -h' for more info.";;
     esac
 done
-shift $(expr $OPTIND - 1)
+shift $(( $OPTIND - 1 ))
 
 # eat up the rest of the cmd-line args if they weren't all gobbled up
 # in the getopts loop
