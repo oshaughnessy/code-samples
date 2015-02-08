@@ -1,0 +1,127 @@
+#!/bin/ksh
+
+##
+# iam-upload-cert
+# 
+# See http://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/SecureConnections.html#CNAMEsAndHTTPS
+# and
+# http://docs.aws.amazon.com/cli/latest/reference/iam/upload-server-certificate.html
+# 
+# Copyright (c) 2015 O'Shaughnessy Evans <shaug+github@wumpus.org>
+##
+
+trap sigdie INT QUIT 
+umask 022
+
+# safety checks:  exit on unset variables and errors, don't expand *
+set -o nounset
+set -o errexit
+set -o noglob
+
+readonly ME=${0##*/}
+readonly VERSION=0.1
+readonly USAGE="usage: $ME [-P _profile_] -p _name_ -k _key_ -p _crt_ -c _chain_ -p _path_"
+aws_profile=default
+cert_chain=
+cert_key=
+cert_name=
+cert_path=
+cert_pub=
+readonly HELP=$(cat <<EOhelp
+$ME: upload an SSL certificate to AWS IAM
+
+Usage: $ME [-P _profile_] -n _name_ -k _key_ -c _crt_ -i _chain_ -p _path_
+       $ME -v
+       $ME -h
+       $ME --help
+
+Options:
+       -v             Show the script version ($VERSION)
+       -h             Show this "help" message
+       --help         Show more comprehensive usage information
+       -P _profile_   Specify an alternate AWS profile (from ~/.aws/config)
+       -n _name_      Server certificate name (no spaces); must not include
+                      the path; used in the CloudFront console to identify
+                      the certificate
+       -k _key_       File path to the certificate private key file
+       -c _crt_       File path to the certificate public key file
+       -i _chain_     File path to the certificate intermediate cert chain
+       -p _path_      Path for the server certificate;
+                      use /cloudfront/_label_/ for CloudFront and choose
+                      a sensible label.
+
+For more information about CloudFront SSL, see:
+* http://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/SecureConnections.html#CNAMEsAndHTTPS
+* http://docs.aws.amazon.com/cli/latest/reference/iam/upload-server-certificate.html
+
+For more information about the path parameter, see:
+* http://docs.aws.amazon.com/IAM/latest/UserGuide/Using_Identifiers.html
+
+For more information about AWS config profiles, see:
+* http://docs.aws.amazon.com/cli/latest/userguide/cli-chap-getting-started.html#using-profiles
+EOhelp)
+
+. $HOME/lib/libadm.sh
+
+# process the command line
+[[ "$1" = "--help" ]] && { perldoc -U -t -F $0; exit $EX_OK; }
+while getopts :P:c:i:k:n:p:vh opt; do
+    case $opt in
+    P)      aws_profile=$OPTARG;;
+    c)      cert_pub=$OPTARG;;
+    i)      cert_chain=$OPTARG;;
+    k)      cert_key=$OPTARG;;
+    n)      cert_name=$OPTARG;;
+    p)      cert_path=$OPTARG;;
+    h)      print "$HELP"; die $EX_OK;;
+    v)      die $EX_OK "version $VERSION";;
+    ?)      die $EX_USAGE "$OPTARG is an invalid option" "$USAGE" \
+                          "See '$ME -h' for more info.";;
+    esac
+done
+shift $(expr $OPTIND - 1)
+
+if [[ -z "$cert_key" ]]; then
+    die $EX_USAGE "failure: a private key filename is required" "$USAGE"
+elif [[ ! -f "$cert_key" ]]; then
+    die $EX_NOEXISTS "failure: $cert_key does not exist"
+else
+    aws_iam_options+=" --private-key file://$cert_key"
+fi
+
+if [[ -z "$cert_pub" ]]; then
+    die $EX_USAGE "failure: a public signed certificate filename is required" "$USAGE"
+elif [[ ! -f "$cert_pub" ]]; then
+    die $EX_NOEXISTS "failure: $cert_pub does not exist"
+else
+    aws_iam_options+=" --certificate-body file://$cert_pub"
+fi
+
+if [[ -z "$cert_chain" ]]; then
+    die $EX_USAGE "failure: an intermediate certificate chain filename is required" "$USAGE"
+elif [[ ! -f "$cert_chain" ]]; then
+    die $EX_NOEXISTS "failure: $cert_chain does not exist"
+else
+    aws_iam_options+=" --certificate-chain file://$cert_chain"
+fi
+
+
+if [[ -n "$aws_profile" ]]; then
+    aws_iam_options+=" --profile $aws_profile"
+fi
+
+if [[ -z "$cert_name" ]]; then
+    die $EX_USAGE "failure: a certificate name is required" "$USAGE"
+else
+    aws_iam_options+=" --server-certificate-name $cert_name"
+fi
+
+if [[ -z "$cert_path" ]]; then
+    die $EX_USAGE "failure: a certificate path is required" "$USAGE"
+else
+    # strip trailing slashes from the path
+    clean_path=$(echo $cert_path |sed -e 's,^/+,/,' -e 's,/+$,,')
+    aws_iam_options+=" --path $clean_path"
+fi
+
+aws iam upload-server-certificate $aws_iam_options
